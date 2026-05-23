@@ -1,7 +1,10 @@
-name: Build Android SO
+name: Build Android AAR 16KB
 
 on:
   workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build:
@@ -9,10 +12,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: '1.25.0'
 
@@ -25,40 +28,54 @@ jobs:
       - name: Install gomobile
         run: |
           export PATH=$PATH:$(go env GOPATH)/bin
-
-          go get golang.org/x/mobile@latest
-          go get -tool golang.org/x/mobile/cmd/gobind
           go install golang.org/x/mobile/cmd/gomobile@latest
           go install golang.org/x/mobile/cmd/gobind@latest
-
           gomobile init
 
-      - name: Build
+      - name: Prepare x/mobile dependency
         run: |
-          export PATH=$PATH:$(go env GOPATH)/bin
-
           go env GOMOD
           go get golang.org/x/mobile@latest
           go get -tool golang.org/x/mobile/cmd/gobind
           go mod tidy
 
+      - name: Build AAR
+        run: |
+          export PATH=$PATH:$(go env GOPATH)/bin
+
           gomobile bind \
             -target=android/arm64 \
             -androidapi 26 \
-            -o lib.aar \
+            -o libSatoshiX.aar \
             ./
 
-      - name: Extract SO
+      - name: Extract AAR only for validation
         run: |
-          unzip lib.aar -d out
-          find out -name "*.so"
+          rm -rf aar_check
+          mkdir aar_check
+          unzip -q libSatoshiX.aar -d aar_check
+          find aar_check -name "*.so"
 
-      - name: Check alignment
+      - name: Check 16KB alignment
         run: |
-          $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf -l out/jni/arm64-v8a/*.so
+          FAILED=0
 
-      - name: Upload
+          for SO_FILE in $(find aar_check/jni -name "*.so"); do
+            echo "Checking: $SO_FILE"
+            $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf -l "$SO_FILE" | grep LOAD
+
+            if $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf -l "$SO_FILE" | grep -q "0x4000"; then
+              echo "OK 16KB: $SO_FILE"
+            else
+              echo "FAILED 16KB: $SO_FILE"
+              FAILED=1
+            fi
+          done
+
+          exit $FAILED
+
+      - name: Upload AAR
         uses: actions/upload-artifact@v4
         with:
-          name: android-so
-          path: out/jni/**/*.so
+          name: libSatoshiX-aar-16kb
+          path: libSatoshiX.aar
