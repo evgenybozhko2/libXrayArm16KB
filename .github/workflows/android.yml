@@ -22,13 +22,13 @@ jobs:
 
       - name: Install Android NDK
         run: |
-          wget https://dl.google.com/android/repository/android-ndk-r28c-linux.zip
-          unzip android-ndk-r28c-linux.zip
-          echo "ANDROID_NDK_HOME=$PWD/android-ndk-r28c" >> $GITHUB_ENV
+          wget -q https://dl.google.com/android/repository/android-ndk-r28c-linux.zip
+          unzip -q android-ndk-r28c-linux.zip
+          echo "ANDROID_NDK_HOME=$PWD/android-ndk-r28c" >> "$GITHUB_ENV"
 
       - name: Install gomobile
         run: |
-          export PATH=$PATH:$(go env GOPATH)/bin
+          export PATH="$PATH:$(go env GOPATH)/bin"
           go install golang.org/x/mobile/cmd/gomobile@latest
           go install golang.org/x/mobile/cmd/gobind@latest
           gomobile init
@@ -39,48 +39,89 @@ jobs:
           go get golang.org/x/mobile@latest
           go get -tool golang.org/x/mobile/cmd/gobind
           go mod tidy
+          go version
+          go list -m golang.org/x/mobile github.com/wlynxg/anet
 
       - name: Build AAR
         run: |
-          export PATH=$PATH:$(go env GOPATH)/bin
+          export PATH="$PATH:$(go env GOPATH)/bin"
 
           gomobile bind \
             -target=android/arm,android/arm64 \
             -androidapi 26 \
+            -ldflags="-checklinkname=0 -extldflags=-Wl,-z,max-page-size=16384" \
             -o libSatoshiX.aar \
             ./
 
-      - name: Extract AAR only for validation
+      - name: Extract AAR for validation
         run: |
-          rm -rf aar_check
-          mkdir aar_check
+          mkdir -p aar_check
           unzip -q libSatoshiX.aar -d aar_check
           find aar_check -name "*.so"
 
-      - name: Check 16KB alignment
+      - name: Check 16KB ELF alignment
         run: |
-          FAILED=0
+          python3 - <<'PY'
+          import os
+          import subprocess
+          from pathlib import Path
 
-          for SO_FILE in $(find aar_check/jni -name "*.so"); do
-            echo "Checking: $SO_FILE"
-            $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf -l "$SO_FILE" | grep LOAD
-      
-            if echo "$SO_FILE" | grep -q "arm64-v8a\|x86_64"; then
-              if $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf -l "$SO_FILE" | grep -q "0x4000"; then
-                echo "OK 16KB: $SO_FILE"
-              else
-                echo "FAILED 16KB: $SO_FILE"
-                FAILED=1
-              fi
-            else
-              echo "SKIP 16KB check for 32-bit ABI: $SO_FILE"
-            fi
-          done
-      
-          exit $FAILED
+          readelf = (
+              Path(os.environ["ANDROID_NDK_HOME"])
+              / "toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          )
+          root = Path("aar_check/jni")
+
+          for abi in ("armeabi-v7a", "arm64-v8a"):
+              if not (root / abi / "libgojni.so").is_file():
+                  raise SystemExit(f"Missing library: {abi}/libgojni.so")
+
+          failed = False
+
+          for library in sorted(root.rglob("*.so")):
+              print(f"Checking: {library}", flush=True)
+              output = subprocess.check_output(
+                  [str(readelf), "-lW", str(library)],
+                  text=True,
+              )
+
+              loads = [
+                  line.split()
+                  for line in output.splitlines()
+                  if line.strip().startswith("LOAD ")
+              ]
+
+              if not loads:
+                  print("FAILED: no LOAD segments")
+                  failed = True
+                  continue
+
+              for segment in loads:
+                  print(" ".join(segment))
+
+              if library.parent.name not in ("arm64-v8a", "x86_64"):
+                  print("SKIP 16KB check for 32-bit ABI")
+                  continue
+
+              alignments = [int(segment[-1], 16) for segment in loads]
+              valid = all(
+                  alignment >= 16384
+                  and alignment & (alignment - 1) == 0
+                  for alignment in alignments
+              )
+
+              if valid:
+                  print("OK: all LOAD segments support 16KB alignment")
+              else:
+                  print("FAILED: insufficient LOAD alignment")
+                  failed = True
+
+          raise SystemExit(1 if failed else 0)
+          PY
 
       - name: Upload AAR
         uses: actions/upload-artifact@v4
         with:
           name: libSatoshiX-aar-16kb
           path: libSatoshiX.aar
+          if-no-files-found: error
